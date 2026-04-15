@@ -1,0 +1,141 @@
+#!/usr/bin/env node
+
+/**
+ * Development CORS Proxy Server
+ *
+ * This proxy server forwards requests from the React frontend (localhost:3000)
+ * to Lambda Function URLs in LocalStack, working around CORS issues.
+ *
+ * Only needed for LocalStack development. AWS production handles CORS correctly.
+ */
+
+const http = require('http');
+const https = require('https');
+const url = require('url');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = 3001;
+
+// Read endpoint mappings from .env.local
+const envFile = path.join(__dirname, '../frontend/.env.local');
+let endpoints = {};
+
+try {
+  const envContent = fs.readFileSync(envFile, 'utf8');
+  const match = envContent.match(/VITE_API_ENDPOINTS='(.+)'/) || envContent.match(/REACT_APP_API_ENDPOINTS='(.+)'/);
+  if (match) {
+    endpoints = JSON.parse(match[1]);
+    console.log('Loaded endpoints:', Object.keys(endpoints));
+  }
+} catch (err) {
+  console.error('Could not load endpoints from .env.local:', err.message);
+  console.error('Make sure to run: ./bin/generate-env.sh first');
+  process.exit(1);
+}
+
+// Proxies requests to target endpoints defined in .env.local
+const server = http.createServer((req, res) => {
+  // Enable CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  // Parse request path: /api/{endpoint_name}
+  const parsedUrl = url.parse(req.url);
+  const pathParts = parsedUrl.pathname.split('/').filter(Boolean);
+
+  if (pathParts[0] !== 'api' || pathParts.length < 2) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      message: 'Development CORS Proxy Server',
+      usage: 'GET /api/{endpoint_name}',
+      endpoints: Object.keys(endpoints).map(name => `http://localhost:${PORT}/api/${name}`)
+    }, null, 2));
+    return;
+  }
+
+  const endpointName = pathParts[1];
+  const subPath = pathParts.slice(2).join('/');
+  
+  const targetBase = endpoints[endpointName];
+  if (!targetBase) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      error: `Unknown endpoint: ${endpointName}`,
+      available: Object.keys(endpoints)
+    }));
+    return;
+  }
+  
+  const targetUrl = targetBase + (subPath ? '/' + subPath : '') + (parsedUrl.search || '');
+
+  console.log(`${req.method} /api/${endpointName} -> ${targetUrl}`);
+
+  // Parse target URL
+  const target = url.parse(targetUrl);
+  const protocol = target.protocol === 'https:' ? https : http;
+
+  // Forward request - preserve original headers but adjust host
+  const forwardHeaders = { ...req.headers };
+  delete forwardHeaders.host;
+  delete forwardHeaders.origin;
+  delete forwardHeaders.referer;
+  
+  const options = {
+    hostname: target.hostname,
+    port: target.port,
+    path: target.path,
+    method: req.method,
+    headers: {
+      ...forwardHeaders,
+      'host': target.host
+    }
+  };
+
+  const proxyReq = protocol.request(options, (proxyRes) => {
+    // Filter out CORS headers from Lambda response since we set our own
+    const headers = { ...proxyRes.headers };
+    delete headers['access-control-allow-origin'];
+    delete headers['access-control-allow-methods'];
+    delete headers['access-control-allow-headers'];
+    delete headers['access-control-max-age'];
+
+    // Forward status and filtered headers
+    res.writeHead(proxyRes.statusCode, headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('Proxy error:', err.message);
+    res.writeHead(502, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Bad Gateway', message: err.message }));
+  });
+
+  req.pipe(proxyReq);
+});
+
+server.listen(PORT, () => {
+  console.log('');
+  console.log('==================================================');
+  console.log(`Listening on: http://localhost:${PORT}`);
+  console.log('==================================================');
+  console.log('');
+  console.log('Available endpoints:');
+  for (const [name, targetUrl] of Object.entries(endpoints)) {
+    console.log(`  /api/${name} -> ${targetUrl}`);
+  }
+  console.log('');
+  console.log('==================================================');
+  console.log(`Update frontend to use: http://localhost:${PORT}`);
+  console.log('==================================================');
+  console.log('');
+});
